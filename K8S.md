@@ -1660,3 +1660,381 @@ Name:      kubernetes
 Address 1: 10.0.0.1 kubernetes.default.svc.cluster.local
 ```
 
+
+
+## 八 部署高可用
+
+![master](./master.png)
+
+
+
+### 部署master2 k01.com
+
+master2 设备初始化
+
+```powershell
+# 根据规划设置主机名
+hostnamectl set-hostname <hostname>
+
+# 关闭防火墙
+systemctl stop firewalld
+systemctl disable firewalld
+
+# 关闭selinux
+sed -i 's/enforcing/disabled/' /etc/selinux/config  # 永久
+setenforce 0  # 临时
+
+# 关闭swap
+swapoff -a  # 临时
+sed -ri 's/.*swap.*/#&/' /etc/fstab    # 永久
+
+
+
+# 在master添加hosts
+cat >> /etc/hosts << EOF
+192.168.168.11 k01.com
+192.168.168.12 k02.com
+192.168.168.13 k03.com
+192.168.168.14 k04.com
+192.168.168.15 k05.com
+EOF
+
+# 将桥接的IPv4流量传递到iptables的链
+cat > /etc/sysctl.d/k8s.conf << EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+sysctl --system  # 生效
+
+# 时间同步
+yum install ntpdate -y
+ntpdate time.windows.com
+```
+
+拷贝k02.com /opt/kubernetes  和service文件
+
+```powershll
+scp -r /opt/kubernetes root@k01.com:/opt/
+scp -r /opt/etcd/ssl root@k01.com:/opt/etcd/ ( 在k01上mkdir -p /opt/etcd/ssl)
+scp /usr/lib/systemd/system/{kube-apiserver,kube-controller-manager,kube-scheduler}.service root@k01.com:/usr/lib/systemd/system
+scp /usr/bin/kubectl root@k01.com:/usr/bin/
+
+vim /opt/kubernetes/cfg/kube-apiserver.conf 
+修改里面的ip地址为自己的ip地址
+
+systemctl start kube-apiserver
+systemctl start kube-controller-manager
+systemctl start kube-scheduler
+
+systemctl enable kube-apiserver
+systemctl enable kube-controller-manager
+systemctl enable kube-scheduler
+
+kubectl get node
+可以查看集群状态
+
+```
+
+
+
+### 部署nginx
+
+
+
+nginx部署在两台master上（因为是测试环境，从节约资源的角度，生产还是要单独的）
+
+```
+Nginx支持四层代理
+http://nginx.org/en/docs/stream/ngx_stream_core_module.html
+该ngx_stream_core_module模块自1.9.0版开始可用。默认情况下，此模块不构建，应使用配置参数启用 --with-stream 。
+
+
+
+nginx官方网站为：www.nginx.org 
+
+
+1.安装pcre库
+pcre兼容正则表达式，安装pcre是为了使nginx支持具备URI重写功能的rewrite模块，如果不安装pcre库，则Nginx无法使用rewrite模块的功能，Nginx的rewrite模块功能几乎是企业应用必须的
+yum install -y pcre pcre-devel
+2.安装openssl-devel
+nginx在使用HTTPS服务时候使用这个模块
+yum install -y openssl openssl-devel
+
+yum -y install epel-release
+yum -y install vim wget lrzsz pcre pcre-devel openssl openssl-devel zlib zlib-devel telnet lua luajit gcc gcc-c++ axel 
+mkdir -p /data/soft && cd /data/soft
+
+```
+
+
+
+
+
+修改nginx配置：
+
+```powershell
+在nginx主配置文件中做如下操作
+stream {
+    upstream k8s-apiserver {
+        server 192.168.168.11:6443;
+        server 192.168.168.12:6443;
+    }
+
+   server {
+        listen 9443;
+        proxy_connect_timeout 5s;
+        proxy_timeout 30s;
+        proxy_pass k8s-apiserver;
+    }
+
+}
+```
+
+
+
+
+
+### 部署keepalived
+
+**我们把16作为vip**
+
+
+
+```
+k01的操作
+主配置文件
+
+yum install -y keepalived
+
+cat /etc/keepalived/keepalived.conf 
+global_defs { 
+   notification_email { 
+     acassen@firewall.loc 
+     failover@firewall.loc 
+     sysadmin@firewall.loc 
+   } 
+   notification_email_from Alexandre.Cassen@firewall.loc  
+   smtp_server 127.0.0.1 
+   smtp_connect_timeout 30 
+   router_id NGINX_MASTER
+} 
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+}
+
+vrrp_instance VI_1 { 
+    state MASTER 
+    interface eth0
+    virtual_router_id 51 # VRRP 路由 ID实例，每个实例是唯一的 
+    priority 100    # 优先级，备服务器设置 90 
+    advert_int 1    # 指定VRRP 心跳包通告间隔时间，默认1秒 
+    authentication { 
+        auth_type PASS      
+        auth_pass 1111 
+    }  
+    virtual_ipaddress { 
+        192.168.168.16/24
+    } 
+    track_script {
+        check_nginx
+    } 
+}
+
+
+cat /etc/keepalived/check_nginx.sh 
+
+#!/bin/bash
+count=$(ps -ef |grep nginx |egrep -cv "grep|$$")
+
+if [ "$count" -eq 0 ];then
+    exit 1
+else
+    exit 0
+fi
+
+
+chmod +x /etc/keepalived/check_nginx.sh 
+
+systemctl start keepalived 
+systemctl status keepalived
+systemctl enable keepalived
+
+
+```
+
+
+
+k02的操作：
+
+```shell
+k02的操作
+主配置文件
+
+yum install -y keepalived
+[root@k02 ~]# cat /etc/keepalived/keepalived.conf
+
+global_defs {
+   notification_email {
+     acassen@firewall.loc
+     failover@firewall.loc
+     sysadmin@firewall.loc
+   }
+   notification_email_from Alexandre.Cassen@firewall.loc
+   smtp_server 127.0.0.1
+   smtp_connect_timeout 30
+   router_id NGINX_BACKUP
+}
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+}
+
+vrrp_instance VI_1 {
+    state BACKUP 
+    interface eth0
+    virtual_router_id 51 # VRRP 路由 ID实例，每个实例是唯一的
+    priority 90    # 优先级，备服务器设置 90
+    advert_int 1    # 指定VRRP 心跳包通告间隔时间，默认1秒
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    virtual_ipaddress {
+        192.168.168.16/24
+    }
+    track_script {
+        check_nginx
+    }
+}
+
+
+[root@k02 ~]# cat /etc/keepalived/check_nginx.sh 
+
+#!/bin/bash
+count=$(ps -ef |grep nginx |egrep -cv "grep|$$")
+
+if [ "$count" -eq 0 ];then
+    exit 1
+else
+    exit 0
+fi
+
+
+chmod +x /etc/keepalived/check_nginx.sh 
+
+systemctl start keepalived 
+systemctl status keepalived
+systemctl enable keepalived
+```
+
+
+
+之后 ipaddr 可以查看 具体的ip地址，192.168.168.10 落在了哪台设备上
+
+
+
+### 删除node(k02.com)
+
+我们最终还是把k02删除了
+
+最终k03 k04 k05留着
+
+```shell
+kubectl delete node k02.com
+```
+
+
+
+
+
+
+
+### 修改node  的masterip 为 vip
+
+
+
+```powershell
+在k03 k04 k05上执行如下操作
+cd /opt/kubernetes/cfg
+grep 192 * 
+
+
+bootstrap.kubeconfig:    server: https://192.168.168.12:6443
+kube-apiserver.conf:--etcd-servers=https://192.168.168.13:2379,https://192.168.168.14:2379,https://192.168.168.15:2379 \
+kube-apiserver.conf:--bind-address=192.168.168.12 \
+kube-apiserver.conf:--advertise-address=192.168.168.12 \
+kubelet.kubeconfig:    server: https://192.168.168.12:6443
+kube-proxy.kubeconfig:    server: https://192.168.168.12:6443
+
+
+
+cd /opt/kubernetes/cfg
+sed -i "s#192.168.168.12:6443#192.168.168.16:9443#g" * 
+systemctl restart kubelet
+systemctl restart kube-proxy
+
+
+
+kubectl get node
+```
+
+
+
+检查vip状态
+
+```powershell
+curl -k --header "Authorization: Bearer c47ffb939f5ca36231d9e3121a252940" https://192.168.168.16:9443/version
+
+
+
+[root@k02 ~]# curl -k --header "Authorization: Bearer c47ffb939f5ca36231d9e3121a252940" https://192.168.168.16:9443/version
+{
+  "major": "1",
+  "minor": "18",
+  "gitVersion": "v1.18.3",
+  "gitCommit": "2e7996e3e2712684bc73f0dec0200d64eec7fe40",
+  "gitTreeState": "clean",
+  "buildDate": "2020-05-20T12:43:34Z",
+  "goVersion": "go1.13.9",
+  "compiler": "gc",
+  "platform": "linux/amd64"
+}
+
+```
+
+
+
+
+
+## 九 总结说明：
+
+```shell
+k01.com 192.168.168.11
+...
+..
+k05.com 192.168.168.15
+vip 192.168.168.16 
+kube-apiserver : 192.168.168.16:9443
+
+
+master:192.168.168.11 
+			 192.168.168.12 
+node:
+		192.168.168.13
+		192.168.168.14
+		192.168.168.15
+
+etcd:
+		13 14 15
+
+密码：
+	k01.com ssh 密码 ： Fjjbfz30% , k01互联网权限：123.125.6.5  -p 1122
+	k02-05  ssh 密码： time.9818
+		
+```
+
+
+
+
+
